@@ -1,0 +1,33 @@
+name: helix-nemotron-reasoning
+version: 1.0.0
+domain: AI/ML
+description: >
+  Fine-tune Nemotron-3-Nano-30B with LoRA to maximize accuracy on logical
+  reasoning puzzles (bit manipulation, encryption, unit conversion, gravity,
+  numeral systems, equation transforms). Submission: LoRA adapter rank <= 32.
+
+scope:
+  editable:
+    - finetune.py
+  readonly:
+    - evaluate.py
+    - helix.yaml
+    - program.md
+    - pyproject.toml
+    - data/train.csv
+    - data/test.csv
+
+metrics:
+  primary:
+    name: accuracy
+    optimize: maximize
+  evaluate:
+    command: uv run finetune.py
+    timeout_seconds: 10800
+    output_format: pattern
+    patterns:
+      primary: '^accuracy:\s+([\d.]+)'
+
+requirements:
+  python: ">=3.12"
+  gpu: "CUDA GPU required (multi-GPU recommended for 30B Mamba model)"
