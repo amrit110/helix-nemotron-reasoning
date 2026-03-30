@@ -37,8 +37,8 @@ LORA_TARGET_MODULES  = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
 
 LEARNING_RATE        = 2e-4
 NUM_EPOCHS           = 1
-BATCH_SIZE           = 1        # per device (30B model is large)
-GRAD_ACCUM           = 16
+BATCH_SIZE           = 8        # per device
+GRAD_ACCUM           = 2
 MAX_SEQ_LEN          = 1024
 WARMUP_RATIO         = 0.05
 LR_SCHEDULER         = "cosine"
