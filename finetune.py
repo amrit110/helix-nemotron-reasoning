@@ -19,6 +19,12 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 import kagglehub
+
+# Monkey-patch missing function before any model code is loaded
+import transformers.utils.import_utils as _import_utils
+if not hasattr(_import_utils, 'is_flash_attn_greater_or_equal_2_10'):
+    _import_utils.is_flash_attn_greater_or_equal_2_10 = lambda: False
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from transformers import DataCollatorForSeq2Seq
 from peft import LoraConfig, get_peft_model, TaskType
@@ -152,13 +158,15 @@ def main():
         lr_scheduler_type=LR_SCHEDULER,
         weight_decay=WEIGHT_DECAY,
         bf16=True,
+        optim="adafactor",
         logging_steps=20,
         save_strategy="no",
         report_to="none",
         seed=SEED,
         remove_unused_columns=False,
         gradient_checkpointing=True,
-        dataloader_num_workers=2,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        dataloader_num_workers=0,
     )
 
     collator = DataCollatorForSeq2Seq(
