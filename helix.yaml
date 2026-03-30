@@ -23,7 +23,7 @@ metrics:
     optimize: maximize
   evaluate:
     command: uv run finetune.py
-    timeout_seconds: 10800
+    timeout_seconds: 3600
     output_format: pattern
     patterns:
       primary: '^accuracy:\s+([\d.]+)'

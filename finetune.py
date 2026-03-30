@@ -36,7 +36,7 @@ LORA_TARGET_MODULES  = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
 # ─── Training hyperparameters ─────────────────────────────────────────────────
 
 LEARNING_RATE        = 2e-4
-NUM_EPOCHS           = 3
+NUM_EPOCHS           = 1
 BATCH_SIZE           = 1        # per device (30B model is large)
 GRAD_ACCUM           = 16
 MAX_SEQ_LEN          = 1024
@@ -46,6 +46,7 @@ WEIGHT_DECAY         = 0.01
 
 # ─── Data / eval config ───────────────────────────────────────────────────────
 
+TRAIN_SAMPLES        = 500      # subsample for fast helix iteration (None = full dataset)
 VAL_SPLIT            = 0.05     # fraction of train held out for validation
 EVAL_SAMPLES         = 200      # number of val examples to evaluate (None = all)
 MAX_NEW_TOKENS       = 256      # tokens to generate during eval
@@ -101,6 +102,8 @@ def main():
 
     # ── Load data ────────────────────────────────────────────────────────────
     df = pd.read_csv(DATA_PATH)
+    if TRAIN_SAMPLES is not None:
+        df = df.sample(n=TRAIN_SAMPLES, random_state=SEED)
     train_df, val_df = train_test_split(df, test_size=VAL_SPLIT, random_state=SEED, shuffle=True)
     print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
