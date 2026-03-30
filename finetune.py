@@ -12,6 +12,8 @@ Hard constraints:
 """
 
 import os
+import sys
+import subprocess
 import time
 import torch
 import pandas as pd
@@ -27,7 +29,7 @@ if not hasattr(_import_utils, 'is_flash_attn_greater_or_equal_2_10'):
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from transformers import DataCollatorForSeq2Seq
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from datasets import Dataset
 
 from evaluate import compute_accuracy
@@ -35,7 +37,7 @@ from evaluate import compute_accuracy
 # ─── LoRA config ─────────────────────────────────────────────────────────────
 
 LORA_RANK            = 32       # must be <= 32
-LORA_ALPHA           = 16
+LORA_ALPHA           = 64       # 2x rank
 LORA_DROPOUT         = 0.05
 LORA_TARGET_MODULES  = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
 
@@ -43,20 +45,21 @@ LORA_TARGET_MODULES  = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
 
 LEARNING_RATE        = 2e-4
 NUM_EPOCHS           = 1
-BATCH_SIZE           = 2        # per device
+BATCH_SIZE           = 1        # per device
 GRAD_ACCUM           = 8
-MAX_SEQ_LEN          = 768
+MAX_SEQ_LEN          = 512
 WARMUP_RATIO         = 0.05
 LR_SCHEDULER         = "cosine"
 WEIGHT_DECAY         = 0.01
 
 # ─── Data / eval config ───────────────────────────────────────────────────────
 
-TRAIN_SAMPLES        = 500      # subsample for fast helix iteration (None = full dataset)
-VAL_SPLIT            = 0.05     # fraction of train held out for validation
-EVAL_SAMPLES         = 200      # number of val examples to evaluate (None = all)
-MAX_NEW_TOKENS       = 256      # tokens to generate during eval
+TRAIN_SAMPLES        = 1000     # subsample for iteration
+VAL_SPLIT            = 0.05     # fraction held out for validation (from full data)
+EVAL_SAMPLES         = 25       # number of val examples to evaluate
+MAX_NEW_TOKENS       = 64       # tokens to generate during eval (answers are short)
 SEED                 = 42
+SKIP_TRAINING        = False    # set True to re-eval existing adapter
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
@@ -106,90 +109,169 @@ def build_dataset(tokenizer, df: pd.DataFrame) -> Dataset:
 def main():
     t0 = time.time()
 
+    # ── Data-parallel training via FSDP ──────────────────────────────────────
+    # Re-launch with torchrun when not already inside a distributed job.
+    # FSDP shards the 30B model across all GPUs so both run simultaneously,
+    # unlike device_map="auto" which pipelines layers sequentially.
+    if "LOCAL_RANK" not in os.environ:
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 1:
+            cmd = [
+                sys.executable, "-m", "torch.distributed.run",
+                f"--nproc_per_node={n_gpus}",
+                "--master_port=29500",
+            ] + sys.argv
+            sys.exit(subprocess.run(cmd).returncode)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main = (local_rank == 0)
+
     # ── Load data ────────────────────────────────────────────────────────────
     df = pd.read_csv(DATA_PATH)
+    # Hold out val from full data for honest evaluation
+    full_train_df, val_df = train_test_split(df, test_size=VAL_SPLIT, random_state=SEED, shuffle=True)
     if TRAIN_SAMPLES is not None:
-        df = df.sample(n=TRAIN_SAMPLES, random_state=SEED)
-    train_df, val_df = train_test_split(df, test_size=VAL_SPLIT, random_state=SEED, shuffle=True)
-    print(f"Train: {len(train_df)}, Val: {len(val_df)}")
+        train_df = full_train_df.sample(n=min(TRAIN_SAMPLES, len(full_train_df)), random_state=SEED)
+    else:
+        train_df = full_train_df
+    if is_main:
+        print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # ── Load model & tokenizer ───────────────────────────────────────────────
     model_path = kagglehub.model_download(
         "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
     )
-    print(f"Model path: {model_path}")
+    if is_main:
+        print(f"Model path: {model_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-    )
+    adapter_exists = (Path(ADAPTER_OUTPUT_DIR) / "adapter_config.json").exists()
 
-    # ── Apply LoRA ────────────────────────────────────────────────────────────
-    lora_config = LoraConfig(
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
-        target_modules=LORA_TARGET_MODULES,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    if SKIP_TRAINING and adapter_exists:
+        # ── Load existing adapter for re-eval (rank 0 only path) ─────────────
+        if is_main:
+            print("Loading existing adapter (SKIP_TRAINING=True)...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="auto",
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+            )
+            model = PeftModel.from_pretrained(model, ADAPTER_OUTPUT_DIR)
+        else:
+            sys.exit(0)
+    else:
+        # ── Load to CPU for FSDP sharding (no device_map) ────────────────────
+        # Each rank loads the full model; FSDP then shards weights to GPUs.
+        # ~60 GB bf16 weights → ~30 GB per GPU on two A100-40GB cards.
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
 
-    # ── Prepare training data ─────────────────────────────────────────────────
-    train_dataset = build_dataset(tokenizer, train_df)
-    print(f"Training examples: {len(train_dataset)}")
+        # ── Apply LoRA ────────────────────────────────────────────────────────
+        lora_config = LoraConfig(
+            r=LORA_RANK,
+            lora_alpha=LORA_ALPHA,
+            target_modules=LORA_TARGET_MODULES,
+            lora_dropout=LORA_DROPOUT,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(model, lora_config)
+        # Cast LoRA adapter weights (float32 by default) to bfloat16 so all
+        # tensors share one dtype — required by FSDP's flat-parameter handle.
+        model = model.to(torch.bfloat16)
+        if is_main:
+            model.print_trainable_parameters()
 
-    # ── Train ─────────────────────────────────────────────────────────────────
-    training_args = TrainingArguments(
-        output_dir=ADAPTER_OUTPUT_DIR,
-        num_train_epochs=NUM_EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=LEARNING_RATE,
-        warmup_ratio=WARMUP_RATIO,
-        lr_scheduler_type=LR_SCHEDULER,
-        weight_decay=WEIGHT_DECAY,
-        bf16=True,
-        optim="adafactor",
-        logging_steps=20,
-        save_strategy="no",
-        report_to="none",
-        seed=SEED,
-        remove_unused_columns=False,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        dataloader_num_workers=0,
-    )
+        # ── Prepare training data ─────────────────────────────────────────────
+        train_dataset = build_dataset(tokenizer, train_df)
+        if is_main:
+            print(f"Training examples: {len(train_dataset)}")
 
-    collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,
-        pad_to_multiple_of=8,
-        label_pad_token_id=-100,
-    )
+        # ── Train with FSDP (full_shard = ZeRO-3 equivalent) ─────────────────
+        training_args = TrainingArguments(
+            output_dir=ADAPTER_OUTPUT_DIR,
+            num_train_epochs=NUM_EPOCHS,
+            per_device_train_batch_size=BATCH_SIZE,
+            gradient_accumulation_steps=GRAD_ACCUM,
+            learning_rate=LEARNING_RATE,
+            warmup_ratio=WARMUP_RATIO,
+            lr_scheduler_type=LR_SCHEDULER,
+            weight_decay=WEIGHT_DECAY,
+            bf16=True,
+            optim="adafactor",
+            logging_steps=10,
+            save_strategy="no",
+            report_to="none",
+            seed=SEED,
+            remove_unused_columns=False,
+            dataloader_num_workers=0,
+            # FSDP: shard model + optimizer states across both GPUs
+            fsdp="full_shard auto_wrap",
+            fsdp_config={
+                "fsdp_min_num_params": 100_000_000,
+                "fsdp_backward_prefetch_policy": "BACKWARD_PRE",
+                "fsdp_state_dict_type": "FULL_STATE_DICT",
+                "fsdp_offload_params": False,
+                "fsdp_forward_prefetch": False,
+                "fsdp_use_orig_params": True,
+                # Use FSDP-native activation checkpointing to avoid redundant
+                # AllGather in backward pass (vs TrainingArguments gradient_checkpointing)
+                "activation_checkpointing": True,
+            },
+        )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=collator,
-    )
-    trainer.train()
+        collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            pad_to_multiple_of=8,
+            label_pad_token_id=-100,
+        )
 
-    # ── Save adapter ──────────────────────────────────────────────────────────
-    Path(ADAPTER_OUTPUT_DIR).mkdir(exist_ok=True)
-    model.save_pretrained(ADAPTER_OUTPUT_DIR)
-    tokenizer.save_pretrained(ADAPTER_OUTPUT_DIR)
-    print(f"Adapter saved to {ADAPTER_OUTPUT_DIR}/")
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            data_collator=collator,
+        )
+        trainer.train()
+
+        # ── Save adapter (rank 0; FULL_STATE_DICT consolidates on rank 0) ─────
+        if is_main:
+            Path(ADAPTER_OUTPUT_DIR).mkdir(exist_ok=True)
+            trainer.save_model(ADAPTER_OUTPUT_DIR)
+            tokenizer.save_pretrained(ADAPTER_OUTPUT_DIR)
+            print(f"Adapter saved to {ADAPTER_OUTPUT_DIR}/")
+
+        # Sync all ranks before cleanup
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+
+        # Non-main ranks exit; only rank 0 continues to evaluation
+        if not is_main:
+            sys.exit(0)
+
+        # ── Reload model with device_map for single-process inference ─────────
+        del trainer, model
+        torch.cuda.empty_cache()
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+        model = PeftModel.from_pretrained(model, ADAPTER_OUTPUT_DIR)
 
     # ── Evaluate ──────────────────────────────────────────────────────────────
     print("\nEvaluating on validation set...")

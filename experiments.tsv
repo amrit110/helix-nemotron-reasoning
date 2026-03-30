@@ -1,4 +1,0 @@
-session	commit	accuracy	quality_guard	status	description
-mar30	f5bf0ef	-		crash	Baseline: batch=1 grad_accum=16 seq=512 - too slow (4min/step)
-mar30	eea7de9	0.360000		keep	Exp1: alpha=64, lr=5e-4, 500 samples, 1 epoch, 25 eval
-mar30	bbdf32b	0.080000		discard	Exp2: alpha=128, lr=3e-4, 2 epochs, fixed val split - worse
